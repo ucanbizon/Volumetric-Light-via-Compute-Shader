@@ -1,0 +1,326 @@
+#version 430 core
+#define RES_WIDTH 640.0
+#define HALFRES_WIDTH 320.0
+#define RES_HEIGHT 360.0
+#define HALFRES_HEIGHT 180.0
+
+#define EPSILON 0.0001
+#define INFINITY 10000.0
+#define PI 3.14159265359
+#define M_MARCHING vec3(0.8,0.0,0.0)
+#define M_TRACING vec3(0.8,0.8,0.8)
+layout (local_size_x = 1, local_size_y = 1) in;
+layout (rgba32f, binding = 0) uniform image2D img_output;\
+
+
+struct Camera{
+	vec3	pos, front, up, right;
+	float	FOV;
+};
+
+
+mat3 m = mat3( 0.00,  0.80,  0.60,
+			  -0.80,  0.36, -0.48,
+			  -0.60, -0.48,  0.64 );
+
+
+uniform float time;
+uniform vec2 iMouse;
+uniform Camera 		camera;
+uniform float walking;
+vec3 tracingSphere0 = vec3( -0.1, 0.45, 0.0);
+vec3 tracingSphere1 = vec3( 0.1, 0.45, 0.0);
+vec3 iResolution = vec3(640, 360, 1);
+
+float iSphere(in vec3 ro, in vec3 rd, in vec3 sph, in float rad)
+{
+	vec3 oc = ro - sph;
+	float b = dot(oc, rd);
+	float c = dot(oc, oc) - rad*rad;
+	float t = b*b - c;
+	if( t > 0.0) 
+		t = -b - sqrt(t);
+	return t;
+}
+
+vec3 nSphere( in vec3 pos, in vec3 sph )
+{
+	return normalize((pos - sph));
+}
+
+
+float floors(in vec3 ro, in vec3 rd)
+{
+    vec3 normal = vec3(0.0,  1.0, 0.0);
+    vec3 center = vec3(0.0,  0.0, 0.0);
+    float denom = dot(rd, normal);
+    if (abs(denom) > EPSILON) 
+    {
+        float t = dot((center - ro),normal) / denom;
+        if (t >= 0){
+             vec2 pos = ro.xz + t*rd.xz;
+             vec2 window = abs(pos) - 0.81;
+             return t; 
+        }
+    }
+    return INFINITY;
+}
+
+float roof(in vec3 ro, in vec3 rd)
+{
+    vec3 normal = vec3(0.0, -1.0, 0.0);
+    vec3 center = vec3(0.0,  1.0, 0.0);
+    float denom = dot(rd, normal);
+    if (abs(denom) > EPSILON) 
+    {
+        float t = dot((center - ro),normal) / denom;
+        if (t >= 0){
+             vec2 pos = ro.xz + t*rd.xz;
+             vec2 window = abs(pos) - 0.81;
+
+        	vec2 beams = 0.030 - abs(mod(pos, 0.54) - 0.27);
+	        if (max(max(window.x, window.y), max(beams.x, beams.y)) < 0.0)
+	        	return INFINITY;
+            return t; 
+        }
+    }
+    return INFINITY;
+}
+
+
+float box(vec3 org, vec3 dir, vec3 size, out float far)
+{
+	vec3 invR = 1.0 / dir;
+	vec3 tbot = invR * (-0.5*size - org);
+	vec3 ttop = invR * (0.5*size - org);
+	vec3 tmin = min (ttop, tbot);
+	vec3 tmax = max (ttop, tbot);
+	
+	vec2 t0 = max (tmin.xx, tmin.yz);
+	float near;
+	near = max (t0.x, t0.y);
+	t0 = min (tmax.xx, tmax.yz);
+	far = min (t0.x, t0.y);
+
+	return near < far && far > 0.0 ? near : INFINITY;
+}
+float box(vec3 org, vec3 dir, vec3 size)
+{
+	float far;
+	return box(org, dir, size, far);
+}
+
+void intersectScene( in vec3 ro, in vec3 rd, out float res, out float id)
+{
+	res = INFINITY;
+	id = -1.0;
+
+	float t = INFINITY;
+    vec3( -0.1, 0.45, 0.0);
+    tracingSphere0 = vec3( -0.1+0.7*sin(time), 0.45,0.7*cos(time));
+	t = iSphere(ro, rd, tracingSphere0, 0.1);
+	if(t > EPSILON)
+	{
+		res = t;
+		id = 1.0;
+	}
+
+	t = iSphere(ro, rd, tracingSphere1, 0.2);
+	if(t > EPSILON && t < res)
+	{
+		res = t;
+		id = 2.0;
+	}
+
+	t = roof(ro, rd);
+	if(t >EPSILON && t < res)
+	{
+		res = t;
+		id = 3.0;
+	}
+	t = floors(ro, rd);
+	if(t >EPSILON && t < res)
+	{
+		res = t;
+		id = 4.0;
+	}
+
+
+
+
+}
+
+float hash (float n)
+{
+	return fract(sin(n)*43758.5453);
+}
+
+float noise (in vec3 x)
+{
+	vec3 p = floor(x);
+	vec3 f = fract(x);
+
+	f = f*f*(3.0-2.0*f);
+
+	float n = p.x + p.y*57.0 + 113.0*p.z;
+
+	float res = mix(mix(mix( hash(n+  0.0), hash(n+  1.0),f.x),
+						mix( hash(n+ 57.0), hash(n+ 58.0),f.x),f.y),
+					mix(mix( hash(n+113.0), hash(n+114.0),f.x),
+						mix( hash(n+170.0), hash(n+171.0),f.x),f.y),f.z);
+	return res;
+}
+
+float transmittance (vec3 p)
+{
+	return exp (0.4*p.z);
+}
+#define STEPS 50
+vec3 inscatter (vec3 ro, vec3 rd, vec3 roLight, vec3 rdLight, vec3 lightDir, float hit, vec2 screenPos)
+{
+	float far;
+	float near = box(roLight +vec3(0.0, 1.0, 0.0), rdLight, vec3(1.5, 3.0, 1.5), far);
+	if(near == INFINITY || hit < near)
+		return vec3(0);
+	
+	float distAlongView = min(hit, far) - near;
+	float oneOverSteps = 1.0/float(STEPS);
+	vec3 step = rd*distAlongView*oneOverSteps;
+	vec3 pos = ro + rd*near;
+	float light = 0.0;
+	
+	pos += rd*noise(vec3(2.0*screenPos, 0.0))*0.05;
+
+	for(int i = 0; i < STEPS; i++)
+	{
+		
+        float t,id;
+        intersectScene( pos, lightDir, t,id);
+        float l = t == INFINITY ? 1.0 : 0.0;
+		l *= transmittance(pos);
+		light += l;
+		pos += step;
+	}
+
+	light *= oneOverSteps * distAlongView;
+	return light*vec3(0.6,0.6, 0.3);
+}
+
+
+
+vec3 rot (vec3 v, vec3 axis, vec2 sincosangle)
+{
+	return v*sincosangle.y + cross(axis, v)*sincosangle.x + axis*(dot(axis, v))*(1.0 - sincosangle.y);
+}
+
+vec3 renderScene(vec3 ro, vec3 rd)
+{
+	float t,id;
+	intersectScene(ro, rd, t, id);
+	
+	vec3 col = vec3(0);
+	vec3 mcol = vec3(0);
+	vec3 p = vec3(1);
+	vec3 n = vec3(1);
+	
+	vec3 lightCol = vec3(1.0,0.9,0.7);
+	vec3 skyCol = vec3(0.3,0.6,1.0)*0.3;
+	vec3 roofCol = vec3(0.0,0.0,0.0);
+	vec3 floorCol = vec3(0.25,0.2,0.2)*0.25;
+	if( id == 1.0)
+	{
+		p = ro + t*rd;
+		n = nSphere(p, tracingSphere0);
+		mcol = M_TRACING;
+	}
+	else
+	if(id == 2.0)
+	{
+		p = ro + t*rd;
+		n = nSphere(p, tracingSphere1);
+		mcol = M_TRACING;
+	}
+	else
+	if (id == 3.0)
+	{
+		p = ro + t*rd;
+		n = vec3(0.0, -1.0, 0.0);
+		mcol = roofCol;
+	}
+	else
+	if (id == 4.0)
+	{
+		p = ro + t*rd;
+		n = vec3(0.0, 1.0, 0.0);
+		mcol = floorCol;
+	}
+
+    else
+    {
+        return vec3(1.0,1.0,1.0);
+    
+    }
+
+    vec3 lightRotAxis = vec3(0.707,0,0.707);
+	vec2 lightAngleSinCos = vec2(sin(0.28), cos(0.28));
+	vec3 lightDir = rot(vec3(0,1,0), lightRotAxis, lightAngleSinCos);
+	float shadowBias = 1.0e-4;
+
+	float tt,iid;
+	intersectScene(p + lightDir*shadowBias, lightDir, tt, iid);
+	if(tt >= INFINITY)
+	{
+		col += clamp(dot(n, lightDir), 0.0, 1.0) * lightCol * mcol;
+	}
+	col += clamp(dot(n, vec3(0,1,0)), 0.0, 1.0)*skyCol*0.7 * mcol;
+	col += clamp(dot(n, -lightDir), 0.0, 1.0)*floorCol*0.1 * mcol;
+	if(t >= INFINITY)col = skyCol;
+
+
+    vec3 normal = vec3(0.0, -1.0, 0.0);
+    vec3 center = vec3(0.0,  1.0, 0.0);
+
+
+	lightAngleSinCos.x *= -1.0; 
+	vec3 roLight = rot(ro -center, lightRotAxis, lightAngleSinCos);
+	vec3 rdLight = rot(rd, lightRotAxis, lightAngleSinCos);
+	col += inscatter(ro, rd, roLight, rdLight, lightDir, t, gl_GlobalInvocationID.xy);
+
+	return col;
+
+
+
+}
+
+
+void initRay(Camera cam, in vec2 fragCoord, out vec3 ro, out vec3 rd){
+	
+	vec3 dir;
+	float a, b;
+
+	a = cam.FOV*( ( float(fragCoord.x) - HALFRES_WIDTH +0.5f) / HALFRES_WIDTH);
+	b = cam.FOV*( ( float(fragCoord.y) - HALFRES_HEIGHT +0.5f) / HALFRES_HEIGHT);
+
+	rd = normalize( a*cam.right + b*cam.up + cam.front);
+	ro = vec3(cam.pos.x, walking*abs(sin(time * 10.0))*0.04f+cam.pos.y, cam.pos.z);
+	
+}
+
+
+
+
+void main(void)
+{
+    vec3 ro, rd;
+	initRay(camera, gl_GlobalInvocationID.xy, ro, rd);
+
+  
+    vec3 col = renderScene(ro, rd);
+
+
+
+    col = pow(col, vec3(1.0/2.2));
+    imageStore(img_output,
+        ivec2(gl_GlobalInvocationID.xy),
+        vec4(col, 0.0));
+}
